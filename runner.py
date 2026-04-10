@@ -32,6 +32,8 @@ WINDOW_BUFFER_SIZE_EVENT = 0x0004
 
 FROM_LEFT_1ST_BUTTON_PRESSED = 0x0001
 
+SHIFT_PRESSED = 0x0010
+
 VK_BACK = 0x08
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
@@ -41,6 +43,8 @@ VK_PRIOR = 0x21  # PageUp
 VK_NEXT = 0x22  # PageDown
 VK_END = 0x23
 VK_HOME = 0x24
+VK_OEM_PLUS = 0xBB
+VK_OEM_MINUS = 0xBD
 
 
 class COORD(ctypes.Structure):
@@ -393,6 +397,66 @@ def load_sessions_config(path: str) -> list[str]:
         return []
 
 
+def save_sessions_config(path: str, names: list[str]) -> None:
+    data = {"sessions": [{"name": n} for n in names]}
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def ensure_sessions_file(path: str) -> None:
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    save_sessions_config(path, ["shell"])
+
+
+def load_runner_settings(path: str) -> dict:
+    defaults = {
+        "keybindings": {
+            "add_session": {"vk": VK_OEM_PLUS, "shift": True},
+            "delete_session": {"vk": VK_OEM_MINUS, "shift": True},
+        }
+    }
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(defaults, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        return defaults
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return defaults
+        kb = data.get("keybindings")
+        if not isinstance(kb, dict):
+            data["keybindings"] = defaults["keybindings"]
+            return data
+        for k in ("add_session", "delete_session"):
+            if not isinstance(kb.get(k), dict):
+                kb[k] = defaults["keybindings"][k]
+            kb[k]["vk"] = int(kb[k].get("vk", defaults["keybindings"][k]["vk"]))
+            kb[k]["shift"] = bool(kb[k].get("shift", defaults["keybindings"][k]["shift"]))
+        return data
+    except Exception:
+        return defaults
+
+
+def next_session_name(existing: list[str], base: str = "shell") -> str:
+    used = set(existing)
+    if base not in used:
+        return base
+    i = 2
+    while True:
+        name = f"{base}-{i}"
+        if name not in used:
+            return name
+        i += 1
+
+
 def _attr_reverse(attr: int) -> int:
     fg = attr & 0x0F
     bg = (attr & 0xF0) >> 4
@@ -440,7 +504,11 @@ def main() -> int:
 
     base_dir = os.path.dirname(os.path.abspath(__file__))
     cfg_path = os.path.join(base_dir, "sessions.json")
+    ensure_sessions_file(cfg_path)
     items = load_sessions_config(cfg_path) or ["shell"]
+    settings_path = os.path.join(base_dir, "runner_settings.json")
+    settings = load_runner_settings(settings_path)
+    kb = settings["keybindings"]
     active = 0
     hit_boxes: list[tuple[int, int]] = []
     last_window_rect: tuple[int, int, int, int] | None = None
@@ -579,6 +647,8 @@ def main() -> int:
                         continue
                     vk = int(ke.wVirtualKeyCode)
                     ch = ke.uChar
+                    ctrl_state = int(ke.dwControlKeyState)
+                    shift = bool(ctrl_state & SHIFT_PRESSED)
 
                     if vk == VK_ESCAPE:
                         if scroll_mode:
@@ -590,6 +660,35 @@ def main() -> int:
                         return 0
                     if ch in ("q", "Q") and not scroll_mode:
                         return 0
+
+                    # Session management keybindings (configurable in runner_settings.json)
+                    if vk == int(kb["add_session"]["vk"]) and shift == bool(kb["add_session"]["shift"]):
+                        new_name = next_session_name(items, "shell")
+                        items.append(new_name)
+                        s = WUakeSession(new_name, ps_exe)
+                        s.start()
+                        sessions.append(s)
+                        active = len(items) - 1
+                        scroll_mode = False
+                        input_buf = ""
+                        save_sessions_config(cfg_path, items)
+                        need_redraw = True
+                        session_changed = True
+                        continue
+
+                    if vk == int(kb["delete_session"]["vk"]) and shift == bool(kb["delete_session"]["shift"]):
+                        if len(items) > 1:
+                            to_del = sessions.pop(active)
+                            to_del.stop()
+                            items.pop(active)
+                            if active >= len(items):
+                                active = len(items) - 1
+                            scroll_mode = False
+                            input_buf = ""
+                            save_sessions_config(cfg_path, items)
+                            need_redraw = True
+                            session_changed = True
+                        continue
 
                     if vk in (VK_PRIOR, VK_NEXT, VK_HOME, VK_END):
                         s = sessions[active]
