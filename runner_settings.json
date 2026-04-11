@@ -2,6 +2,17 @@
   "keybindings": {
     "add_session": { "vk": 187, "shift": true },
     "delete_session": { "vk": 189, "shift": true }
+  },
+  "backend": {
+    "mode": "subprocess",
+    "powershell_exe": "powershell.exe",
+    "ssh": {
+      "host": "",
+      "user": "",
+      "port": 22,
+      "remote_shell": "pwsh",
+      "ssh_binary": "ssh"
+    }
   }
 }
 

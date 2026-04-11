@@ -33,7 +33,7 @@ python .\wuake.py
 
 ## runner.py (меню сессий)
 
-`runner.py` читает названия сессий из `sessions.json`, поднимает отдельный PowerShell-процесс на каждую сессию и даёт переключаться кликом по нижнему меню (история команд/вывода хранится отдельно для каждой сессии).
+`runner.py` читает названия сессий из `sessions.json`, поднимает отдельный backend PowerShell на каждую сессию и даёт переключаться кликом по нижнему меню (история команд/вывода хранится отдельно для каждой сессии).
 
 Запуск:
 
@@ -57,4 +57,48 @@ python .\runner.py
 - `Shift` + `-`: удалить активную сессию (если она не последняя)
 - `Esc` или `q`: выход
 
-Хоткеи лежат в `runner_settings.json` (можно поменять под себя).
+Хоткеи и backend лежат в `runner_settings.json` (можно поменять под себя).
+
+### Настройка backend для `runner.py`
+
+`runner.py` использует класс-прослойку из `powershell_backends.py`.
+Выбор метода задаётся через `runner_settings.json`:
+
+```json
+{
+  "backend": {
+    "mode": "subprocess",
+    "powershell_exe": "powershell.exe",
+    "ssh": {
+      "host": "",
+      "user": "",
+      "port": 22,
+      "remote_shell": "pwsh",
+      "ssh_binary": "ssh"
+    }
+  }
+}
+```
+
+Поддерживаемые режимы:
+
+- `subprocess` — текущий локальный режим через `subprocess.Popen` (поведение по умолчанию).
+- `dotnet` — вариант через .NET PowerShell SDK (runspace). Требует `pythonnet` и доступную сборку `System.Management.Automation`.
+- `ssh` — запуск удалённого PowerShell в рамках SSH-сессии.
+
+Пример SSH-конфигурации:
+
+```json
+{
+  "backend": {
+    "mode": "ssh",
+    "ssh": {
+      "host": "10.0.0.25",
+      "user": "admin",
+      "port": 22,
+      "remote_shell": "pwsh",
+      "ssh_binary": "ssh"
+    }
+  }
+}
+```

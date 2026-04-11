@@ -1,10 +1,12 @@
 import ctypes
 import json
 import os
-import subprocess
 import sys
 import time
 from ctypes import wintypes
+from typing import Any
+
+from powershell_backends import PowerShellBackend, create_backend
 
 
 KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -283,100 +285,33 @@ def build_menu(items: list[str], active_idx: int) -> tuple[str, list[tuple[int, 
     return "".join(parts), hit
 
 
-SENTINEL = "__WUAKE__END__"
-
-
-def make_ps_loop() -> str:
-    # Read one line, run it, print sentinel to mark end.
-    return rf"""
-$ErrorActionPreference = 'Continue'
-function prompt {{ '' }}
-while ($true) {{
-  $line = [Console]::In.ReadLine()
-  if ($null -eq $line) {{ break }}
-  if ([string]::IsNullOrWhiteSpace($line)) {{ Write-Output '{SENTINEL}'; continue }}
-  try {{
-    Invoke-Expression $line
-  }} catch {{
-    $_ | Out-String | Write-Output
-  }}
-  Write-Output '{SENTINEL}'
-}}
-exit
-"""
-
-
 class WUakeSession:
-    def __init__(self, name: str, ps_exe: str):
+    def __init__(self, name: str, backend_config: dict[str, Any]):
         self.name = name
-        self.ps_exe = ps_exe
-        self.proc: subprocess.Popen[str] | None = None
+        self.backend: PowerShellBackend = create_backend(backend_config)
         self.transcript: list[str] = []
         self.cmd_history: list[str] = []
         self.history_idx: int | None = None
         self.scroll_offset = 0  # 0 = bottom (latest)
 
     def start(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            return
-        self.proc = subprocess.Popen(
-            [
-                self.ps_exe,
-                "-NoLogo",
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-NoExit",
-                "-Command",
-                make_ps_loop(),
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
+        self.backend.start()
 
     def stop(self) -> None:
-        if not self.proc:
-            return
-        try:
-            if self.proc.stdin:
-                self.proc.stdin.write("exit\n")
-                self.proc.stdin.flush()
-                self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.terminate()
-        except Exception:
-            pass
+        self.backend.stop()
 
     def run_command(self, cmd: str) -> list[str]:
         self.start()
-        assert self.proc is not None
-        assert self.proc.stdin is not None
-        assert self.proc.stdout is not None
 
         self.cmd_history.append(cmd)
         self.history_idx = None
         self.scroll_offset = 0
 
         self.transcript.append(f"ps> {cmd}")
-        self.proc.stdin.write(cmd + "\n")
-        self.proc.stdin.flush()
-
-        out_lines: list[str] = []
-        while True:
-            line = self.proc.stdout.readline()
-            if line == "":
-                break
-            s = line.rstrip("\r\n")
-            if s == SENTINEL:
-                break
-            out_lines.append(s)
+        try:
+            out_lines = self.backend.run_command(cmd)
+        except Exception as exc:
+            out_lines = [f"[backend error] {exc}"]
 
         if out_lines:
             self.transcript.extend(out_lines)
@@ -418,7 +353,18 @@ def load_runner_settings(path: str) -> dict:
         "keybindings": {
             "add_session": {"vk": VK_OEM_PLUS, "shift": True},
             "delete_session": {"vk": VK_OEM_MINUS, "shift": True},
-        }
+        },
+        "backend": {
+            "mode": "subprocess",
+            "powershell_exe": os.environ.get("WUAKE_POWERSHELL", "powershell.exe"),
+            "ssh": {
+                "host": "",
+                "user": "",
+                "port": 22,
+                "remote_shell": "pwsh",
+                "ssh_binary": "ssh",
+            },
+        },
     }
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -440,6 +386,30 @@ def load_runner_settings(path: str) -> dict:
                 kb[k] = defaults["keybindings"][k]
             kb[k]["vk"] = int(kb[k].get("vk", defaults["keybindings"][k]["vk"]))
             kb[k]["shift"] = bool(kb[k].get("shift", defaults["keybindings"][k]["shift"]))
+        backend = data.get("backend")
+        if not isinstance(backend, dict):
+            data["backend"] = defaults["backend"]
+            backend = data["backend"]
+        mode = str(backend.get("mode", defaults["backend"]["mode"])).strip().lower()
+        if mode not in {"subprocess", "dotnet", "ssh"}:
+            mode = defaults["backend"]["mode"]
+        backend["mode"] = mode
+        backend["powershell_exe"] = str(
+            backend.get("powershell_exe", defaults["backend"]["powershell_exe"])
+        ).strip() or defaults["backend"]["powershell_exe"]
+        ssh = backend.get("ssh")
+        if not isinstance(ssh, dict):
+            ssh = {}
+            backend["ssh"] = ssh
+        ssh_defaults = defaults["backend"]["ssh"]
+        ssh["host"] = str(ssh.get("host", ssh_defaults["host"])).strip()
+        ssh["user"] = str(ssh.get("user", ssh_defaults["user"])).strip()
+        try:
+            ssh["port"] = int(ssh.get("port", ssh_defaults["port"]))
+        except Exception:
+            ssh["port"] = int(ssh_defaults["port"])
+        ssh["remote_shell"] = str(ssh.get("remote_shell", ssh_defaults["remote_shell"])).strip() or ssh_defaults["remote_shell"]
+        ssh["ssh_binary"] = str(ssh.get("ssh_binary", ssh_defaults["ssh_binary"])).strip() or ssh_defaults["ssh_binary"]
         return data
     except Exception:
         return defaults
@@ -515,10 +485,13 @@ def main() -> int:
     input_buf = ""
     scroll_mode = False
 
-    ps_exe = os.environ.get("WUAKE_POWERSHELL", "powershell.exe")
-    sessions = [WUakeSession(name, ps_exe) for name in items]
+    backend_config = settings["backend"]
+    sessions = [WUakeSession(name, backend_config) for name in items]
     for s in sessions:
-        s.start()
+        try:
+            s.start()
+        except Exception as exc:
+            s.transcript.append(f"[backend error] {exc}")
 
     def wrap_to_width(lines: list[str], width: int) -> list[str]:
         out: list[str] = []
@@ -665,7 +638,7 @@ def main() -> int:
                     if vk == int(kb["add_session"]["vk"]) and shift == bool(kb["add_session"]["shift"]):
                         new_name = next_session_name(items, "shell")
                         items.append(new_name)
-                        s = WUakeSession(new_name, ps_exe)
+                        s = WUakeSession(new_name, backend_config)
                         s.start()
                         sessions.append(s)
                         active = len(items) - 1
