@@ -15,8 +15,11 @@ def main() -> int:
 $ErrorActionPreference = 'Continue'
 function prompt {{ '' }}
 while ($true) {{
-  $line = [Console]::In.ReadLine()
-  if ($null -eq $line) {{ break }}
+  try {{
+    $line = Read-Host -Prompt ''
+  }} catch {{
+    break
+  }}
   if ([string]::IsNullOrWhiteSpace($line)) {{ Write-Output '{SENTINEL}'; continue }}
   try {{
     Invoke-Expression $line
