@@ -1,4 +1,7 @@
 {
+  "console": {
+    "preserve_quick_edit": false
+  },
   "keybindings": {
     "add_session": { "vk": 187, "shift": true },
     "delete_session": { "vk": 189, "shift": true }

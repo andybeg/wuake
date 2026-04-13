@@ -10,6 +10,7 @@ from powershell_backends import PowerShellBackend, create_backend
 
 
 KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+USER32 = ctypes.WinDLL("user32", use_last_error=True)
 
 STD_INPUT_HANDLE = -10
 STD_OUTPUT_HANDLE = -11
@@ -47,6 +48,11 @@ VK_END = 0x23
 VK_HOME = 0x24
 VK_OEM_PLUS = 0xBB
 VK_OEM_MINUS = 0xBD
+VK_TAB = 0x09
+VK_C = 0x43
+
+LEFT_CTRL_PRESSED = 0x0008
+RIGHT_CTRL_PRESSED = 0x0004
 
 
 class COORD(ctypes.Structure):
@@ -169,6 +175,27 @@ KERNEL32.FillConsoleOutputAttribute.argtypes = [
 ]
 KERNEL32.FillConsoleOutputAttribute.restype = wintypes.BOOL
 
+GMEM_MOVEABLE = 0x0002
+CF_UNICODETEXT = 13
+
+USER32.OpenClipboard.argtypes = [wintypes.HWND]
+USER32.OpenClipboard.restype = wintypes.BOOL
+USER32.CloseClipboard.argtypes = []
+USER32.CloseClipboard.restype = wintypes.BOOL
+USER32.EmptyClipboard.argtypes = []
+USER32.EmptyClipboard.restype = wintypes.BOOL
+USER32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+USER32.SetClipboardData.restype = wintypes.HANDLE
+
+KERNEL32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+KERNEL32.GlobalAlloc.restype = wintypes.HANDLE
+KERNEL32.GlobalLock.argtypes = [wintypes.HANDLE]
+KERNEL32.GlobalLock.restype = ctypes.c_void_p
+KERNEL32.GlobalUnlock.argtypes = [wintypes.HANDLE]
+KERNEL32.GlobalUnlock.restype = wintypes.BOOL
+KERNEL32.GlobalFree.argtypes = [wintypes.HANDLE]
+KERNEL32.GlobalFree.restype = wintypes.HANDLE
+
 
 def _check(ok: bool) -> None:
     if not ok:
@@ -204,12 +231,53 @@ def enable_vt_output(h_out) -> None:
     set_console_mode(h_out, mode)
 
 
-def enable_mouse_input(h_in) -> None:
+def enable_mouse_input(h_in, preserve_quick_edit: bool = False) -> None:
     mode = get_console_mode(h_in)
-    # Disable Quick Edit (иначе мышь выделяет текст и события клика "залипают")
-    mode &= ~ENABLE_QUICK_EDIT_MODE
+    # По умолчанию Quick Edit выключен: иначе мышь выделяет текст и клики по меню сессий
+    # не приходят в ReadConsoleInput. См. console.preserve_quick_edit в runner_settings.json
+    if not preserve_quick_edit:
+        mode &= ~ENABLE_QUICK_EDIT_MODE
     mode |= ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT | ENABLE_WINDOW_INPUT
     set_console_mode(h_in, mode)
+
+
+def ctrl_down(ctrl_state: int) -> bool:
+    return bool(ctrl_state & (LEFT_CTRL_PRESSED | RIGHT_CTRL_PRESSED))
+
+
+def copy_text_to_clipboard(text: str) -> bool:
+    """Копирует UTF-16 в буфер обмена Windows. Возвращает True при успехе."""
+    payload = (text + "\0").encode("utf-16-le")
+    n = len(payload)
+    if not USER32.OpenClipboard(None):
+        return False
+    ok = False
+    h_mem = None
+    try:
+        if not USER32.EmptyClipboard():
+            return False
+        h_mem = KERNEL32.GlobalAlloc(GMEM_MOVEABLE, n)
+        if not h_mem:
+            return False
+        p = KERNEL32.GlobalLock(h_mem)
+        if not p:
+            KERNEL32.GlobalFree(h_mem)
+            return False
+        try:
+            ctypes.memmove(p, payload, n)
+        finally:
+            KERNEL32.GlobalUnlock(h_mem)
+        if USER32.SetClipboardData(CF_UNICODETEXT, h_mem):
+            ok = True
+            h_mem = None  # владение передано системе
+        else:
+            KERNEL32.GlobalFree(h_mem)
+            h_mem = None
+    finally:
+        USER32.CloseClipboard()
+        if h_mem:
+            KERNEL32.GlobalFree(h_mem)
+    return ok
 
 
 def read_console_input(h_in, max_events: int = 1) -> list[INPUT_RECORD]:
@@ -365,6 +433,9 @@ def load_runner_settings(path: str) -> dict:
                 "ssh_binary": "ssh",
             },
         },
+        "console": {
+            "preserve_quick_edit": False,
+        },
     }
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -410,6 +481,14 @@ def load_runner_settings(path: str) -> dict:
             ssh["port"] = int(ssh_defaults["port"])
         ssh["remote_shell"] = str(ssh.get("remote_shell", ssh_defaults["remote_shell"])).strip() or ssh_defaults["remote_shell"]
         ssh["ssh_binary"] = str(ssh.get("ssh_binary", ssh_defaults["ssh_binary"])).strip() or ssh_defaults["ssh_binary"]
+        console = data.get("console")
+        if not isinstance(console, dict):
+            console = {}
+            data["console"] = console
+        console_defaults = defaults["console"]
+        console["preserve_quick_edit"] = bool(
+            console.get("preserve_quick_edit", console_defaults["preserve_quick_edit"])
+        )
         return data
     except Exception:
         return defaults
@@ -478,6 +557,7 @@ def main() -> int:
     items = load_sessions_config(cfg_path) or ["shell"]
     settings_path = os.path.join(base_dir, "runner_settings.json")
     settings = load_runner_settings(settings_path)
+    preserve_quick_edit = bool(settings["console"]["preserve_quick_edit"])
     kb = settings["keybindings"]
     active = 0
     hit_boxes: list[tuple[int, int]] = []
@@ -584,7 +664,7 @@ def main() -> int:
             win_set_cursor(h_out, left_x + cx, input_y)
 
     try:
-        enable_mouse_input(h_in)
+        enable_mouse_input(h_in, preserve_quick_edit=preserve_quick_edit)
         redraw(full=True)
 
         while True:
@@ -633,6 +713,25 @@ def main() -> int:
                         return 0
                     if ch in ("q", "Q") and not scroll_mode:
                         return 0
+
+                    if ctrl_down(ctrl_state) and vk == VK_C and shift:
+                        body = "\n".join(sessions[active].transcript)
+                        copy_text_to_clipboard(body)
+                        need_redraw = True
+                        continue
+
+                    if ctrl_down(ctrl_state) and vk == VK_TAB:
+                        if len(items) > 1:
+                            if shift:
+                                active = (active - 1) % len(items)
+                            else:
+                                active = (active + 1) % len(items)
+                            input_buf = ""
+                            scroll_mode = False
+                            sessions[active].scroll_offset = 0
+                            need_redraw = True
+                            session_changed = True
+                        continue
 
                     # Session management keybindings (configurable in runner_settings.json)
                     if vk == int(kb["add_session"]["vk"]) and shift == bool(kb["add_session"]["shift"]):
